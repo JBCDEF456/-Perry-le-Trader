@@ -92,7 +92,7 @@ def calculate_adx(high, low, close, period=14):
     return float(adx)
 
 
-def check_strict_trend_and_adx(symbol, timeframe_h1=mt5.TIMEFRAME_H1, period=14, adx_threshold=22.0):
+def check_strict_trend_and_adx(symbol, timeframe_h1=mt5.TIMEFRAME_H1, period=14, adx_threshold=18.0):
     rates = mt5.copy_rates_from_pos(symbol, timeframe_h1, 0, period * 3)
     if rates is None or len(rates) < period * 2:
         return False, "Données H1 insuffisantes"
@@ -334,6 +334,14 @@ def listen_telegram_commands():
                             elif text == "/status":
                                 send_session_summary("ℹ️ **STATUT EN DIRECT (SESSION EN COURS)**")
 
+                            elif text == "/pull":
+                                send_telegram_message(
+                                    "🔄 **MISE À JOUR DEMANDÉE**\n\nArrêt sécurisé de Perry pour le `git pull`...")
+                                is_running = False
+                                time.sleep(1)
+                                mt5.shutdown()
+                                sys.exit(99)
+
                             elif text == "/stop":
                                 send_telegram_message("🛑 **Le patron veut que je m'arrête !!!** Arrêt en cours...")
                                 is_running = False
@@ -341,6 +349,7 @@ def listen_telegram_commands():
                                 time.sleep(1.5)
                                 mt5.shutdown()
                                 print("Bot arrêté avec succès.")
+                                sys.exit(0)
                                 break
 
         except Exception:
@@ -379,6 +388,27 @@ def is_economic_news_coming():
         print(f"Erreur vérification calendrier éco : {e}")
 
     return False
+
+def restore_tracked_positions():
+    positions = mt5.positions_get(group=f"*{MAGIC_NUMBER}*")
+    if positions:
+        for p in positions:
+            if p.ticket not in ACTIVE_TRACKED_POSITIONS:
+                symbol_info = mt5.symbol_info(p.symbol)
+                point = symbol_info.point if symbol_info else 0.0001
+                sl_dist = abs(p.price_open - p.sl) if p.sl > 0 else (20 * point)
+
+                ACTIVE_TRACKED_POSITIONS[p.ticket] = {
+                    "symbol": p.symbol,
+                    "type": "BUY" if p.type == mt5.ORDER_TYPE_BUY else "SELL",
+                    "rsi": 50.0,
+                    "macd": 0.0,
+                    "spread": 1.0,
+                    "entry_price": p.price_open,
+                    "sl_distance": sl_dist,
+                    "be_applied": True  # Sécurité pour éviter un break-even
+                }
+        print(f"🔄 {len(positions)} position(s) active(s) resynchronisée(s) après redémarrage.")
 
 
 def is_trading_session_active(symbol):
@@ -579,7 +609,7 @@ def send_order(symbol, order_type, rsi_val, macd_val):
     # FILTRE DE TENDANCE STRICT H1 + ADX
     can_trade, trend_res = check_strict_trend_and_adx(symbol)
     if not can_trade:
-        send_telegram_message(f"🚫 **Filtre H1/ADX** [{symbol}] : {trend_res}")
+        #send_telegram_message(f"🚫 **Filtre H1/ADX** [{symbol}] : {trend_res}")
         return
 
     if order_type != trend_res:
@@ -881,6 +911,7 @@ def manage_open_positions():
 if __name__ == "__main__":
     initialize_mt5()
     pm.init_db()
+    restore_tracked_positions()
 
     session_stats["start_time"] = datetime.datetime.now()
     session_stats["initial_balance"] = get_account_balance()
