@@ -32,7 +32,7 @@ class BudgetManager:
     SAVE_INTERVAL_SEC      = 5.0
 
     def __init__(self):
-        self.lock = threading.Lock()
+        self.lock = threading.RLock()
         self.state = self._default_state()
         self._last_save = 0.0
         self._save_pending = False
