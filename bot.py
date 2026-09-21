@@ -1,5 +1,8 @@
-import time
+import os
 import sys
+import json
+import time
+import queue
 import datetime
 import threading
 import requests
@@ -7,654 +10,428 @@ import MetaTrader5 as mt5
 import pandas as pd
 import numpy as np
 import perry_memory as pm
+import budget_manager as bm
 
-# Params Telegram et Tactiques de Jeu
+# Config pour le nouveau job de Perry
+
 TELEGRAM_TOKEN = "8803422841:AAGQklfLQfkbFkqrVkrnBVYWwT9VCGCFR6k"
 TELEGRAM_CHAT_ID = "6552751822"
 FMP_API_KEY = "c4MfYeznxUSNi4F8doGCoXw7VCb3xvzo"
 
-SYMBOLS_DAY = ["EURUSD", "GBPUSD", "USDCHF"]
-SYMBOLS_NIGHT = ["USDJPY", "AUDUSD", "NZDUSD", "AUDJPY"]
-SYMBOLS = SYMBOLS_DAY + SYMBOLS_NIGHT
+SYMBOL = "XAUUSD"
+TIMEFRAME = mt5.TIMEFRAME_M30
 
-TIMEFRAME = mt5.TIMEFRAME_M5
-
-# Gestion du risque & Sécurités
-RISK_PERCENT = 1.0
-MIN_BALANCE_STOP = 5.0
-MAX_DAILY_LOSS_PCT = 10.0
-MAX_CONSECUTIVE_LOSSES = 3
-PAUSE_HOURS_AFTER_LOSSES = 2
-
-# Paramètres ATR
+# Stratégie Pullback validée
 ATR_SL_MULTIPLIER = 1.5
-ATR_TRAILING_MULTIPLIER = 1.2
+RR_RATIO = 2.5
+ADX_MIN = 22.0
+ADX_PERIOD = 14
+ATR_RATIO_MIN = 0.9
+RSI_BUY_MIN, RSI_BUY_MAX = 40, 58
+RSI_SELL_MIN, RSI_SELL_MAX = 42, 60
+SESSION_START_UTC = 7
+SESSION_END_UTC = 21
 
-MAX_SPREAD_PIPS = 2.0
-MAX_CONCURRENT_TRADES = 3
-COOLDOWN_MINUTES = 15
+# Trailing / BE
+ATR_TRAILING_MULTIPLIER = 2.0
+ATR_BE_TRIGGER = 0.5
+PARTIAL_TP_R = 1.0
+PARTIAL_TP_PCT = 0.5
+TIME_STOP_HOURS = 12
+
+# Risque
+MIN_BALANCE_STOP = 20.0
+MAX_SPREAD_DOLLARS = 0.60
+MAX_CONCURRENT_TRADES = 1
+COOLDOWN_MINUTES = 30
 MAGIC_NUMBER = 998877
 
-is_running = True
+STATE_FILE = "perry_state.json"
+CYCLE_SLEEP_SEC = 5.0
 
-# Mémoires locales
+# Etat global
+
+is_running = True
+pull_requested = False
 VALID_FILLING_MODES = {}
 ACTIVE_TRACKED_POSITIONS = {}
 SYMBOL_COOLDOWNS = {}
-consecutive_losses = 0
-bot_pause_until = None
+cooldown_lock = threading.Lock()
+state_lock = threading.Lock()
 
 session_stats = {
-    "start_time": None,
-    "initial_balance": 0.0,
-    "trades_executed": 0,
-    "closed_wins": 0,
-    "closed_losses": 0
+    "start_time": None, "initial_balance": 0.0,
+    "trades_executed": 0, "closed_wins": 0, "closed_losses": 0
 }
 
+budget_mgr = bm.BudgetManager()
 
-# Filtre avancés dans les ordres
+# Thread Telegram
 
-def calculate_adx(high, low, close, period=14):
-    plus_dm = np.diff(high)
-    minus_dm = -np.diff(low)
-
-    plus_dm[plus_dm < 0] = 0
-    minus_dm[minus_dm < 0] = 0
-
-    plus_dm[plus_dm <= minus_dm] = 0
-    minus_dm[minus_dm <= plus_dm] = 0
-
-    tr1 = high[1:] - low[1:]
-    tr2 = np.abs(high[1:] - close[:-1])
-    tr3 = np.abs(low[1:] - close[:-1])
-    tr = np.maximum(tr1, np.maximum(tr2, tr3))
-
-    def wilder_smoothing(arr, n):
-        smoothed = np.zeros_like(arr)
-        if len(arr) < n:
-            return smoothed
-        smoothed[n - 1] = np.sum(arr[:n])
-        for i in range(n, len(arr)):
-            smoothed[i] = smoothed[i - 1] - (smoothed[i - 1] / n) + arr[i]
-        return smoothed
-
-    if len(tr) < period * 2:
-        return 25.0
-
-    tr_smoothed = wilder_smoothing(tr, period)
-    plus_di = 100 * wilder_smoothing(plus_dm, period) / (tr_smoothed + 1e-9)
-    minus_di = 100 * wilder_smoothing(minus_dm, period) / (tr_smoothed + 1e-9)
-
-    dx = 100 * np.abs(plus_di - minus_di) / (plus_di + minus_di + 1e-9)
-    adx = np.mean(dx[-period:])
-
-    return float(adx)
+_tg_queue = queue.Queue(maxsize=300)
 
 
-def check_strict_trend_and_adx(symbol, timeframe_h1=mt5.TIMEFRAME_H1, period=14, adx_threshold=18.0):
-    rates = mt5.copy_rates_from_pos(symbol, timeframe_h1, 0, period * 3)
-    if rates is None or len(rates) < period * 2:
-        return False, "Données H1 insuffisantes"
-
-    close_prices = rates['close']
-    high_prices = rates['high']
-    low_prices = rates['low']
-
-    sma_20 = np.mean(close_prices[-20:])
-    sma_50 = np.mean(close_prices[-50:]) if len(close_prices) >= 50 else np.mean(close_prices)
-    current_price = close_prices[-1]
-
-    is_bullish_trend = (current_price > sma_20) and (sma_20 > sma_50)
-    is_bearish_trend = (current_price < sma_20) and (sma_20 < sma_50)
-
-    if not is_bullish_trend and not is_bearish_trend:
-        return False, "Marché en consolidation en H1"
-
-    adx_value = calculate_adx(high_prices, low_prices, close_prices, period)
-    if adx_value < adx_threshold:
-        return False, f"Tendance H1 trop faible (ADX: {adx_value:.1f})"
-
-    trend_direction = "BUY" if is_bullish_trend else "SELL"
-    return True, trend_direction
-
-
-# Gestion notification telegram
-
-def update_closed_trades_stats():
-    from_date = session_stats.get("start_time", datetime.datetime.now())
-    to_date = datetime.datetime.now() + datetime.timedelta(hours=1)
-    history = mt5.history_deals_get(from_date, to_date)
-
-    if history is None or len(history) == 0:
-        return
-
-    closed_wins = 0
-    closed_losses = 0
-
-    for deal in history:
-        if deal.entry == mt5.DEAL_ENTRY_OUT and deal.magic == MAGIC_NUMBER:
-            if deal.profit > 0:
-                closed_wins += 1
-            elif deal.profit < 0:
-                closed_losses += 1
-
-    session_stats["closed_wins"] = closed_wins
-    session_stats["closed_losses"] = closed_losses
+def _telegram_worker():
+    while is_running:
+        try:
+            msg = _tg_queue.get(timeout=1)
+        except queue.Empty:
+            continue
+        try:
+            requests.post(
+                f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+                json={"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "Markdown"},
+                timeout=5,
+            )
+        except Exception as e:
+            print(f"TG err : {e}")
 
 
 def send_telegram_message(message):
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": message,
-        "parse_mode": "Markdown"
-    }
     try:
-        requests.post(url, json=payload, timeout=5)
-    except Exception as e:
-        print(f"Erreur d'envoi Telegram : {e}")
+        _tg_queue.put_nowait(message)
+        if _tg_queue.qsize() > 50:
+            print(f"⚠️ TG queue : {_tg_queue.qsize()}")
+    except queue.Full:
+        print("🚨 TG queue saturée")
 
 
-def send_telegram_kpi_report():
-    try:
-        import sqlite3
-
-        now = datetime.datetime.now()
-        start_of_week = (now - datetime.timedelta(days=now.weekday())).strftime("%Y-%m-%d 00:00:00")
-
-        conn = sqlite3.connect(pm.DB_FILE)
-        query = f"""
-            SELECT profit, result, timestamp 
-            FROM trade_experience 
-            WHERE profit IS NOT NULL AND profit != 0 
-              AND timestamp >= '{start_of_week}'
-        """
-        df = pd.read_sql_query(query, conn)
-        conn.close()
-
-        if df.empty:
-            send_telegram_message("📊 **KPI SEMAINE EN COURS**\n\n⚠️ Aucun trade clôturé enregistré depuis ce lundi.")
-            return
-
-        profits = df['profit'].values
-        gains = profits[profits > 0]
-        pertes = profits[profits < 0]
-
-        gross_profits = np.sum(gains) if len(gains) > 0 else 0.0
-        gross_losses = abs(np.sum(pertes)) if len(pertes) > 0 else 1e-6
-        profit_factor = gross_profits / gross_losses
-
-        initial_cap = session_stats.get("initial_balance", 1000.0)
-        if initial_cap <= 0:
-            initial_cap = get_account_balance()
-            if initial_cap <= 0:
-                initial_cap = 1000.0
-
-        equity_curve = np.cumsum(profits) + initial_cap
-        peak = np.maximum.accumulate(equity_curve)
-        drawdown = (equity_curve - peak) / peak
-        max_drawdown_pct = abs(np.min(drawdown)) * 100.0 if len(drawdown) > 0 else 0.0
-
-        returns = profits / initial_cap
-        mean_return = np.mean(returns)
-        std_return = np.std(returns, ddof=1) if len(returns) > 1 else 0.0
-
-        downside_returns = returns[returns < 0]
-        downside_std = np.std(downside_returns, ddof=1) if len(downside_returns) > 1 else 0.0
-
-        rf_per_trade = 0.0
-        sharpe_ratio = (mean_return - rf_per_trade) / std_return if std_return > 1e-8 else 0.0
-        sortino_ratio = (mean_return - rf_per_trade) / downside_std if downside_std > 1e-8 else 0.0
-
-        sharpe_ratio = max(min(sharpe_ratio, 100.0), -100.0)
-        sortino_ratio = max(min(sortino_ratio, 100.0), -100.0)
-        win_rate = (len(gains) / len(profits)) * 100.0
-
-        msg = (
-            f"📊 **PERFORMANCES KPI (SEMAINE EN COURS)**\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"⏱️ **Période** : Depuis le {start_of_week[:10]}\n"
-            f"📈 **Trades exécutés** : {len(profits)}\n"
-            f"🎯 **Win Rate** : {win_rate:.1f} %\n"
-            f"💰 **Profit Factor** : {profit_factor:.2f}  ({'✅' if profit_factor >= 1.5 else '⚠️'})\n"
-            f"📉 **Max Drawdown** : {max_drawdown_pct:.2f} %\n"
-            f"📐 **Sharpe Ratio** : {sharpe_ratio:.2f}\n"
-            f"📊 **Sortino Ratio** : {sortino_ratio:.2f}\n"
-            f"💵 **PnL Semaine** : {np.sum(profits):+.2f} $"
-        )
-        send_telegram_message(msg)
-
-    except Exception as e:
-        send_telegram_message(f"❌ **Erreur lors du calcul des KPI** : {e}")
+def flush_telegram(timeout=3.0):
+    deadline = time.time() + timeout
+    while not _tg_queue.empty() and time.time() < deadline:
+        time.sleep(0.1)
 
 
-def send_telegram_state_status():
-    mt5_conn = "✅ Connecté" if mt5.terminal_info() else "🚨 Déconnecté"
+# Nouvelles du journal 🐻
 
-    if bot_pause_until and datetime.datetime.now() < bot_pause_until:
-        bot_state = f"⏸️ En pause jusqu'à {bot_pause_until.strftime('%H:%M:%S')}"
-    else:
-        bot_state = "🟢 Actif & En recherche"
-
-    active_positions = mt5.positions_get(group=f"*{MAGIC_NUMBER}*")
-    nb_open = len(active_positions) if active_positions else 0
-    uptime_str = session_stats['start_time'].strftime('%d/%m à %H:%M:%S') if session_stats.get(
-        'start_time') else "Inconnu"
-
-    msg = (
-        f"🖥️ **SANTÉ SYSTÈME & ÉTAT DE PERRY**\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"🐻 **État de Perry** : {bot_state}\n"
-        f"🔌 **Connexion MT5** : {mt5_conn}\n"
-        f"📊 **Positions Ouvertes** : {nb_open} / {MAX_CONCURRENT_TRADES}\n"
-        f"⏱️ **Lancement Session** : {uptime_str}\n"
-        f"💰 **Solde Compte** : {get_account_balance():.2f} $"
-    )
-    send_telegram_message(msg)
+_news_state = {"blocked": False, "last_check": 0.0, "last_event": ""}
+_news_lock = threading.Lock()
+NEWS_REFRESH_SEC = 180
+NEWS_BLOCK_WINDOW = 30
 
 
-def send_session_summary(header_title="📊 **BILAN DE SESSION**"):
-    update_closed_trades_stats()
-
-    current_balance = get_account_balance()
-    initial_balance = session_stats["initial_balance"]
-    pnl = current_balance - initial_balance
-    pnl_pct = ((current_balance - initial_balance) / initial_balance) * 100 if initial_balance > 0 else 0
-
-    wins = session_stats.get("closed_wins", 0)
-    losses = session_stats.get("closed_losses", 0)
-    total_closed = wins + losses
-    win_rate = (wins / total_closed * 100) if total_closed > 0 else 0.0
-
-    msg = (
-        f"{header_title}\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"💰 **Capital initial** : {initial_balance:.2f} $\n"
-        f"💵 **Capital actuel** : {current_balance:.2f} $\n"
-        f"📈 **PnL** : {pnl:+.2f} $ ({pnl_pct:+.4f}%)\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"✅ **Trades clôturés** : {total_closed} (Gagnants: {wins} | Perdants: {losses})\n"
-        f"🎯 **Taux de réussite** : {win_rate:.1f} %\n"
-    )
-    send_telegram_message(msg)
-
-
-def listen_telegram_commands():
-    global is_running
-    last_update_id = 0
-
-    try:
-        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates"
-        response = requests.get(url, timeout=5).json()
-        if "result" in response and len(response["result"]) > 0:
-            last_update_id = response["result"][-1]["update_id"]
-    except Exception as e:
-        print(f"Erreur vidange Telegram : {e}")
-
-    while is_running:
-        try:
-            url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates?offset={last_update_id + 1}&timeout=10"
-            response = requests.get(url, timeout=12).json()
-
-            if "result" in response:
-                for update in response["result"]:
-                    last_update_id = update["update_id"]
-
-                    if "message" in update and "text" in update["message"]:
-                        text = update["message"]["text"].strip().lower()
-                        chat_id = str(update["message"]["chat"]["id"])
-
-                        if chat_id == str(TELEGRAM_CHAT_ID):
-                            if text == "/start":
-                                session_stats["start_time"] = datetime.datetime.now()
-                                session_stats["initial_balance"] = get_account_balance()
-                                session_stats["trades_executed"] = 0
-
-                                pairs_str = ", ".join(SYMBOLS)
-                                start_msg = (
-                                    f"🚀 **SESSION DE TRADING INITIALISÉE**\n"
-                                    f"━━━━━━━━━━━━━━━━━━━━\n"
-                                    f"• **Paires surveillées** : {pairs_str}\n"
-                                    f"• **Timeframe** : M5\n"
-                                    f"• **Solde Initial** : {session_stats['initial_balance']:.2f} $\n\n"
-                                    f"📱 **Commandes disponibles :**\n"
-                                    f"• `/status` : Bilan en direct de la session\n"
-                                    f"• `/start` : Réinitialiser la session à zéro\n"
-                                    f"• `/stop` : Arrêter le bot et afficher le bilan final"
-                                )
-                                send_telegram_message(start_msg)
-
-                            elif text == "/kpi":
-                                send_telegram_kpi_report()
-
-                            elif text == "/state":
-                                send_telegram_state_status()
-
-                            elif text == "/status":
-                                send_session_summary("ℹ️ **STATUT EN DIRECT (SESSION EN COURS)**")
-
-                            elif text == "/pull":
-                                send_telegram_message(
-                                    "🔄 **MISE À JOUR DEMANDÉE**\n\nArrêt sécurisé de Perry pour le `git pull`...")
-                                is_running = False
-                                time.sleep(1)
-                                mt5.shutdown()
-                                sys.exit(99)
-
-                            elif text == "/stop":
-                                send_telegram_message("🛑 **Le patron veut que je m'arrête !!!** Arrêt en cours...")
-                                is_running = False
-                                send_session_summary("📊 **BILAN FINAL DE SESSION**")
-                                time.sleep(1.5)
-                                mt5.shutdown()
-                                print("Bot arrêté avec succès.")
-                                sys.exit(0)
-                                break
-
-        except Exception:
-            time.sleep(2)
-
-
-# Filtre economique et la securite
-
-def is_economic_news_coming():
-    if not FMP_API_KEY or FMP_API_KEY == "c4MfYeznxUSNi4F8doGCoXw7VCb3xyzo":
-        return False
-
+def _fetch_news_blocking_state():
+    if not FMP_API_KEY or FMP_API_KEY == "YOUR_FMP_KEY_HERE":
+        return False, ""
     try:
         today = datetime.datetime.now().strftime("%Y-%m-%d")
-        url = f"https://financialmodelingprep.com/api/v3/economic_calendar?from={today}&to={today}&apikey={FMP_API_KEY}"
-        res = requests.get(url, timeout=5)
+        url = (f"https://financialmodelingprep.com/api/v3/economic_calendar"
+               f"?from={today}&to={today}&apikey={FMP_API_KEY}")
+        res = requests.get(url, timeout=3)
         if res.status_code != 200:
-            return False
-
-        events = res.json()
+            return False, ""
         now = datetime.datetime.utcnow()
-
-        for event in events:
-            if event.get("impact") == "High" and event.get("currency") in ["USD", "EUR", "GBP", "JPY", "AUD", "NZD",
-                                                                           "CAD"]:
-                event_date_str = event.get("date")
-                if event_date_str:
-                    event_time = datetime.datetime.strptime(event_date_str, "%Y-%m-%d %H:%M:%S")
-                    diff_minutes = abs((event_time - now).total_seconds()) / 60.0
-                    if diff_minutes <= 30:
-                        event_title = event.get("event", "Impact Majeur")
-                        send_telegram_message(
-                            f"⚠️ **FILTRE ÉCO ACTIF**\n\nAnnonce imminente : *{event_title}* dans {int(diff_minutes)} min.\nPrise de position suspendue.")
-                        return True
+        for ev in res.json():
+            if ev.get("impact") != "High":
+                continue
+            if ev.get("currency") not in ["USD", "EUR", "GBP", "JPY", "AUD", "NZD", "CAD"]:
+                continue
+            ds = ev.get("date")
+            if not ds:
+                continue
+            et = datetime.datetime.strptime(ds, "%Y-%m-%d %H:%M:%S")
+            if abs((et - now).total_seconds()) / 60.0 <= NEWS_BLOCK_WINDOW:
+                return True, ev.get("event", "?")
     except Exception as e:
-        print(f"Erreur vérification calendrier éco : {e}")
-
-    return False
-
-def restore_tracked_positions():
-    positions = mt5.positions_get(group=f"*{MAGIC_NUMBER}*")
-    if positions:
-        for p in positions:
-            if p.ticket not in ACTIVE_TRACKED_POSITIONS:
-                symbol_info = mt5.symbol_info(p.symbol)
-                point = symbol_info.point if symbol_info else 0.0001
-                sl_dist = abs(p.price_open - p.sl) if p.sl > 0 else (20 * point)
-
-                ACTIVE_TRACKED_POSITIONS[p.ticket] = {
-                    "symbol": p.symbol,
-                    "type": "BUY" if p.type == mt5.ORDER_TYPE_BUY else "SELL",
-                    "rsi": 50.0,
-                    "macd": 0.0,
-                    "spread": 1.0,
-                    "entry_price": p.price_open,
-                    "sl_distance": sl_dist,
-                    "be_applied": True  # Sécurité pour éviter un break-even
-                }
-        print(f"🔄 {len(positions)} position(s) active(s) resynchronisée(s) après redémarrage.")
+        print(f"News fetch err : {e}")
+    return False, ""
 
 
-def is_trading_session_active(symbol):
-    current_hour = datetime.datetime.now().hour
-    if current_hour == 22:
-        return False
-
-    if symbol in SYMBOLS_DAY:
-        return 8 <= current_hour < 18
-    elif symbol in SYMBOLS_NIGHT:
-        return current_hour >= 23 or current_hour < 8
-
-    return True
-
-
-def is_in_cooldown(symbol):
-    if symbol in SYMBOL_COOLDOWNS:
-        last_closed_time = SYMBOL_COOLDOWNS[symbol]
-        if datetime.datetime.now() < last_closed_time + datetime.timedelta(minutes=COOLDOWN_MINUTES):
-            return True
-        else:
-            del SYMBOL_COOLDOWNS[symbol]
-    return False
+def news_refresher_thread():
+    global _news_state
+    while is_running:
+        try:
+            blocked, evt = _fetch_news_blocking_state()
+            with _news_lock:
+                prev = _news_state.get("blocked", False)
+                _news_state = {"blocked": blocked, "last_check": time.time(), "last_event": evt}
+            if blocked and not prev:
+                send_telegram_message(f"⚠️ **NEWS ÉCO** : *{evt}*\nEntrées suspendues ±30 min.")
+        except Exception as e:
+            print(f"News refresher err : {e}")
+        time.sleep(NEWS_REFRESH_SEC)
 
 
-def check_funds_and_loss_safety():
-    global is_running
-    account_info = mt5.account_info()
-    if account_info is None:
-        return True
-
-    balance = account_info.balance
-    equity = account_info.equity
-    initial_balance = session_stats["initial_balance"]
-
-    if balance <= MIN_BALANCE_STOP or equity <= MIN_BALANCE_STOP:
-        msg = (
-            f"⚠️ **ARRÊT D'URGENCE - FONDS ÉPUISÉS / INSUFFISANTS** ⚠️\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"• **Solde actuel** : {balance:.2f} $\n"
-            f"• **Équité actuelle** : {equity:.2f} $\n"
-            f"• **Seuil critique** : {MIN_BALANCE_STOP:.2f} $\n\n"
-            f"🔴 *Perry s'arrête pour protéger votre compte.*"
-        )
-        send_telegram_message(msg)
-        close_all_open_positions()
-        send_session_summary("📊 **BILAN FINAL DE SESSION (SOLDE INSUFFISANT)**")
-        is_running = False
-        mt5.shutdown()
-        return False
-
-    if initial_balance > 0:
-        loss_pct = ((initial_balance - balance) / initial_balance) * 100
-        if loss_pct >= MAX_DAILY_LOSS_PCT:
-            msg = (
-                f"🚨 **ARRÊT DE SÉCURITÉ - PERTE SEUIL ATTEINTE ({MAX_DAILY_LOSS_PCT:.1f}%)** 🚨\n"
-                f"━━━━━━━━━━━━━━━━━━━━\n"
-                f"• **Perte accumulée** : -{loss_pct:.2f}%\n"
-                f"• **Solde initial** : {initial_balance:.2f} $\n"
-                f"• **Solde actuel** : {balance:.2f} $\n\n"
-                f"⏸ *Perry s'arrête définitivement pour aujourd'hui.*"
-            )
-            send_telegram_message(msg)
-            close_all_open_positions()
-            send_session_summary("📊 **BILAN FINAL DE SESSION (PERTE MAX DÉPASSÉE)**")
-            is_running = False
-            mt5.shutdown()
-            return False
-
-    return True
+def is_economic_news_coming():
+    with _news_lock:
+        return _news_state.get("blocked", False)
 
 
-def close_all_open_positions():
-    positions = mt5.positions_get(group=f"*{MAGIC_NUMBER}*")
-    if positions:
-        for pos in positions:
-            close_position(pos)
+# Persistance
+
+def save_state():
+    try:
+        with state_lock:
+            data = {
+                "session_stats": session_stats,
+                "symbol_cooldowns": {s: t.isoformat() for s, t in SYMBOL_COOLDOWNS.items()},
+            }
+        with open(STATE_FILE, "w") as f:
+            json.dump(data, f, default=str)
+    except Exception as e:
+        print(f"⚠️ save_state : {e}")
 
 
-# Moteur de trading de Perry
+def load_state():
+    if not os.path.exists(STATE_FILE):
+        return
+    try:
+        with open(STATE_FILE) as f:
+            data = json.load(f)
+        session_stats.update(data.get("session_stats", {}))
+        if session_stats.get("start_time"):
+            session_stats["start_time"] = datetime.datetime.fromisoformat(session_stats["start_time"])
+        for s, t in data.get("symbol_cooldowns", {}).items():
+            SYMBOL_COOLDOWNS[s] = datetime.datetime.fromisoformat(t)
+    except Exception as e:
+        print(f"⚠️ load_state : {e}")
+
+
+# Indicateurs
+
+def compute_indicators(df):
+    df = df.copy()
+    df['EMA20'] = df['close'].ewm(span=20, adjust=False).mean()
+    df['EMA50'] = df['close'].ewm(span=50, adjust=False).mean()
+
+    delta = df['close'].diff()
+    gain = (delta.where(delta > 0, 0)).rolling(14).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
+    rs = gain / loss
+    df['RSI'] = 100 - (100 / (1 + rs))
+
+    high, low, close = df['high'], df['low'], df['close']
+    plus_dm = high.diff().clip(lower=0)
+    minus_dm = (-low.diff()).clip(lower=0)
+    tr = pd.concat([high - low, (high - close.shift()).abs(),
+                    (low - close.shift()).abs()], axis=1).max(axis=1)
+    atr = tr.rolling(ADX_PERIOD).mean()
+    plus_di = 100 * (plus_dm.rolling(ADX_PERIOD).mean() / atr)
+    minus_di = 100 * (minus_dm.rolling(ADX_PERIOD).mean() / atr)
+    dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di)
+    df['ADX'] = dx.rolling(ADX_PERIOD).mean()
+    df['ATR'] = atr
+    df['ATR_AVG'] = atr.rolling(50).mean()
+    df['ATR_RATIO'] = df['ATR'] / df['ATR_AVG']
+    return df
+
+
+# Signal Pullback
+
+def check_signal():
+    rates = mt5.copy_rates_from_pos(SYMBOL, TIMEFRAME, 0, 200)
+    if rates is None or len(rates) < 60:
+        return None, 50.0, 0.0, None
+
+    df = pd.DataFrame(rates)
+    df['time'] = pd.to_datetime(df['time'], unit='s')
+    df = compute_indicators(df)
+
+    c = df.iloc[-2]           # dernière barre clôturée
+    p = df.iloc[-3]
+
+    # Validations NaN
+    if pd.isna(c['EMA50']) or pd.isna(c['ADX']) or pd.isna(c['ATR_RATIO']) or pd.isna(c['RSI']):
+        return None, 50.0, 0.0, df
+
+    # Filtre jour / session
+    t = df['time'].iloc[-2]
+    if t.weekday() >= 5:
+        return None, c['RSI'], c['ATR'], df
+    if not (SESSION_START_UTC <= t.hour < SESSION_END_UTC):
+        return None, c['RSI'], c['ATR'], df
+
+    # Filtres régime
+    if c['ATR_RATIO'] < ATR_RATIO_MIN:
+        return None, c['RSI'], c['ATR'], df
+    if c['ADX'] < ADX_MIN:
+        return None, c['RSI'], c['ATR'], df
+
+    # Tendance EMA avec pente
+    ema50_3ago = df.iloc[-5]['EMA50']
+    trend_up = c['EMA20'] > c['EMA50'] and c['EMA50'] > ema50_3ago
+    trend_dn = c['EMA20'] < c['EMA50'] and c['EMA50'] < ema50_3ago
+
+    signal = None
+    if (trend_up and c['low'] <= c['EMA20'] and c['close'] > c['EMA20']
+            and c['close'] > c['open'] and RSI_BUY_MIN < c['RSI'] < RSI_BUY_MAX):
+        signal = "BUY"
+    elif (trend_dn and c['high'] >= c['EMA20'] and c['close'] < c['EMA20']
+          and c['close'] < c['open'] and RSI_SELL_MIN < c['RSI'] < RSI_SELL_MAX):
+        signal = "SELL"
+
+    return signal, float(c['RSI']), float(c['ATR']), df
+
+
+# Soutient MT5
+
+def get_account_balance():
+    ai = mt5.account_info()
+    return ai.balance if ai else 0.0
+
 
 def initialize_mt5():
     if not mt5.initialize():
-        msg = f"❌ **Échec d'initialisation MT5** (code {mt5.last_error()})"
-        print(msg)
-        send_telegram_message(msg)
-        mt5.shutdown()
+        send_telegram_message(f"❌ Init MT5 échouée ({mt5.last_error()})")
         sys.exit()
-    print("Connexion réussie à MetaTrader 5 !")
+    init_filling_modes()
+    if not mt5.symbol_select(SYMBOL, True):
+        send_telegram_message(f"⚠️ Impossible de sélectionner {SYMBOL}")
+    print(f"✅ MT5 connecté — {SYMBOL} M30")
+
+
+def init_filling_modes():
+    info = mt5.symbol_info(SYMBOL)
+    if info is None:
+        VALID_FILLING_MODES[SYMBOL] = mt5.ORDER_FILLING_IOC
+        return
+    if info.filling_mode & mt5.SYMBOL_FILLING_IOC:
+        VALID_FILLING_MODES[SYMBOL] = mt5.ORDER_FILLING_IOC
+    elif info.filling_mode & mt5.SYMBOL_FILLING_FOK:
+        VALID_FILLING_MODES[SYMBOL] = mt5.ORDER_FILLING_FOK
+    else:
+        VALID_FILLING_MODES[SYMBOL] = mt5.ORDER_FILLING_RETURN
 
 
 def ensure_mt5_connection():
     if not mt5.terminal_info():
-        send_telegram_message("⚠️ **ALERTE VPS** : Perte de connexion MT5. Reconnexion en cours...")
-        attempts = 0
-        while attempts < 10:
+        send_telegram_message("⚠️ Perte MT5, reconnexion...")
+        for _ in range(10):
             time.sleep(5)
             if mt5.initialize():
-                send_telegram_message("✅ **SUCCÈS** : Connexion MT5 rétablie avec succès.")
+                init_filling_modes()
+                send_telegram_message("✅ MT5 rétabli.")
                 return True
-            attempts += 1
-
-        send_telegram_message("🚨 **ERREUR CRITIQUE** : Impossible de reconnecter MT5 sur le VPS !")
+        send_telegram_message("🚨 Impossible de reconnecter MT5.")
         return False
     return True
 
 
-def get_account_balance():
-    account_info = mt5.account_info()
-    return account_info.balance if account_info else 0.0
+def safe_order_send(request, max_retries=3):
+    last = None
+    for _ in range(max_retries):
+        result = mt5.order_send(request)
+        last = result
+        if result and result.retcode == mt5.TRADE_RETCODE_DONE:
+            return result
+        if result and result.retcode in (mt5.TRADE_RETCODE_REQUOTE,
+                                          mt5.TRADE_RETCODE_PRICE_CHANGED,
+                                          mt5.TRADE_RETCODE_PRICE_OFF):
+            time.sleep(0.5)
+            t = mt5.symbol_info_tick(request["symbol"])
+            if t:
+                request["price"] = t.ask if request["type"] == mt5.ORDER_TYPE_BUY else t.bid
+            continue
+        return result
+    return last
 
 
-def calculate_position_size(symbol, sl_distance):
-    account_info = mt5.account_info()
-    symbol_info = mt5.symbol_info(symbol)
-
-    if account_info is None or symbol_info is None or sl_distance <= 0:
-        return 0.01
-
-    balance = account_info.balance
-    risk_amount = balance * (RISK_PERCENT / 100.0)
-
-    tick_value = symbol_info.trade_tick_value
-    tick_size = symbol_info.trade_tick_size
-
-    if tick_value == 0 or tick_size == 0:
-        return 0.01
-
-    value_per_unit = tick_value / tick_size
-    raw_lot = risk_amount / (sl_distance * value_per_unit)
-
-    step_lot = symbol_info.volume_step
-    min_lot = symbol_info.volume_min
-    max_lot = symbol_info.volume_max
-
-    calculated_lot = round(raw_lot / step_lot) * step_lot
-    return round(max(min_lot, min(calculated_lot, max_lot)), 2)
+def get_current_spread_dollars():
+    tick = mt5.symbol_info_tick(SYMBOL)
+    if tick is None:
+        return None
+    return tick.ask - tick.bid
 
 
-def check_signal(symbol):
-    now = datetime.datetime.now()
-    day_of_week = now.weekday()
-    current_hour = now.hour
+# Calcul de la poso sur l'or
 
-    if day_of_week == 4 and current_hour >= 21:
-        return None, None, None
-    if day_of_week in [5, 6]:
-        return None, None, None
+def calculate_position_size(sl_distance, risk_percent):
+    ai = mt5.account_info()
+    si = mt5.symbol_info(SYMBOL)
+    if ai is None or si is None or sl_distance <= 0:
+        return 0.01, 0, 0
 
-    rates = mt5.copy_rates_from_pos(symbol, TIMEFRAME, 0, 100)
-    if rates is None or len(rates) < 50:
-        return None, 50.0, 0.0
+    balance = ai.balance
+    risk_amount_target = balance * (risk_percent / 100.0)
 
-    df = pd.DataFrame(rates)
-    df['SMA20'] = df['close'].rolling(window=20).mean()
-    df['SMA50'] = df['close'].rolling(window=50).mean()
+    tv = si.trade_tick_value
+    ts = si.trade_tick_size
+    if tv == 0 or ts == 0:
+        return 0.01, 0, 0
 
-    delta = df['close'].diff()
-    gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
-    rs = gain / loss
-    df['RSI'] = 100 - (100 / (1 + rs))
+    value_per_unit = tv / ts
+    raw_lot = risk_amount_target / (sl_distance * value_per_unit)
+    step = si.volume_step
+    min_lot = si.volume_min
+    lots = round(raw_lot / step) * step
+    lots = max(min_lot, min(lots, si.volume_max))
+    lots = round(lots, 2)
 
-    ema12 = df['close'].ewm(span=12, adjust=False).mean()
-    ema26 = df['close'].ewm(span=26, adjust=False).mean()
-    macd_line = ema12 - ema26
-    signal_line = macd_line.ewm(span=9, adjust=False).mean()
-    df['MACD'] = macd_line - signal_line
+    # Perte réelle
+    risky_dollars = lots * sl_distance * value_per_unit
+    risky_pct = (risky_dollars / balance * 100) if balance > 0 else 0
 
-    prev = df.iloc[-3]
-    curr = df.iloc[-2]
-
-    golden_cross = (prev['SMA20'] <= prev['SMA50']) and (curr['SMA20'] > curr['SMA50'])
-    death_cross = (prev['SMA20'] >= prev['SMA50']) and (curr['SMA20'] < curr['SMA50'])
-    rsi_val = curr['RSI']
-    macd_val = curr['MACD']
-
-    if golden_cross and (45 < rsi_val < 70):
-        return "BUY", rsi_val, macd_val
-    elif death_cross and (30 < rsi_val < 55):
-        return "SELL", rsi_val, macd_val
-
-    return None, rsi_val, macd_val
+    return lots, risky_dollars, risky_pct
 
 
-def send_order(symbol, order_type, rsi_val, macd_val):
-    global bot_pause_until
+# Ordre
 
+def send_order(order_type, rsi_val, atr_val, df):
     if not ensure_mt5_connection():
         return
-
-    if bot_pause_until and datetime.datetime.now() < bot_pause_until:
-        return
-
     if is_economic_news_coming():
+        print("🛑 Bloqué par news éco")
         return
 
-    # FILTRE DE TENDANCE STRICT H1 + ADX
-    can_trade, trend_res = check_strict_trend_and_adx(symbol)
+    balance = get_account_balance()
+
+    can_trade, reason = budget_mgr.can_open_trade(SYMBOL, balance)
     if not can_trade:
-        #send_telegram_message(f"🚫 **Filtre H1/ADX** [{symbol}] : {trend_res}")
+        print(f"[{SYMBOL}] Budget refuse : {reason}")
         return
 
-    if order_type != trend_res:
+    # Spread check
+    spread = get_current_spread_dollars()
+    if spread is None:
+        return
+    if spread > MAX_SPREAD_DOLLARS:
+        print(f"[{SYMBOL}] Spread trop élevé : {spread:.2f}$")
         return
 
-    confidence, risk_factor, rr_ratio = pm.evaluate_trade_confidence(symbol, order_type, rsi_val, macd_val)
-
-    if risk_factor == 0.0:
-        msg_hesit = f"🧠 **PERRY HÉSITE** ({confidence:.1f}% de confiance) sur **{symbol}**.\n\n_Signal {order_type} ignoré pour protéger le capital._"
-        send_telegram_message(msg_hesit)
+    # Vérifier positions actives
+    active = mt5.positions_get(group=f"*{MAGIC_NUMBER}*")
+    if active and len(active) >= MAX_CONCURRENT_TRADES:
         return
 
-    if not is_trading_session_active(symbol):
+    # Cooldown
+    with cooldown_lock:
+        if SYMBOL in SYMBOL_COOLDOWNS:
+            if datetime.datetime.now() < SYMBOL_COOLDOWNS[SYMBOL] + datetime.timedelta(minutes=COOLDOWN_MINUTES):
+                return
+
+    # Confidence mémoire
+    confidence, risk_factor, rr_ratio = pm.evaluate_trade_confidence(
+        SYMBOL, order_type, rsi_val, atr_val)
+    if risk_factor <= 0:
+        send_telegram_message(f"🧠 Perry hésite ({confidence:.1f}%) sur {SYMBOL}.")
         return
 
-    if is_in_cooldown(symbol):
-        return
-
-    active_positions = mt5.positions_get(group=f"*{MAGIC_NUMBER}*")
-    if active_positions and len(active_positions) >= MAX_CONCURRENT_TRADES:
-        return
-
-    if not mt5.symbol_select(symbol, True):
-        return
-
-    tick = mt5.symbol_info_tick(symbol)
-    symbol_info = mt5.symbol_info(symbol)
-
-    if tick is None or symbol_info is None:
-        return
-
-    point = symbol_info.point
-    current_spread_pips = (tick.ask - tick.bid) / point / 10.0
-    if current_spread_pips > MAX_SPREAD_PIPS:
-        return
-
-    atr_val = pm.get_atr_value(symbol)
-    if atr_val is None:
-        return
-
+    # ATR + SL/TP
     sl_distance = atr_val * ATR_SL_MULTIPLIER
-    tp_distance = sl_distance * rr_ratio
+    tp_distance = sl_distance * RR_RATIO
 
-    base_lot = calculate_position_size(symbol, sl_distance)
-    final_lot = max(symbol_info.volume_min, round(base_lot * risk_factor, 2))
+    # Risk %
+    risk_pct = budget_mgr.get_risk_percent(SYMBOL, balance)
+    if risk_pct <= 0:
+        return
+
+    # Position size
+    lots, risky_dollars, risky_pct = calculate_position_size(sl_distance, risk_pct)
+
+    # Alerte si le lot minimum dépasse le budget
+    if risky_pct > 1.5:
+        send_telegram_message(
+            f"⚠️ **RISQUE ÉLEVÉ** : lot 0.01 sur {SYMBOL} = {risky_dollars:.2f}$ "
+            f"({risky_pct:.2f}% du capital)\n"
+            f"Capital actuel : {balance:.2f}$"
+        )
+    if risky_pct > 3.0:
+        send_telegram_message(f"🛑 Lot minimum dépasse 3% — trade annulé")
+        return
+
+    tick = mt5.symbol_info_tick(SYMBOL)
+    if tick is None:
+        return
 
     if order_type == "BUY":
         price = tick.ask
@@ -667,309 +444,502 @@ def send_order(symbol, order_type, rsi_val, macd_val):
         tp = price - tp_distance
         type_op = mt5.ORDER_TYPE_SELL
 
-    fill_mode = VALID_FILLING_MODES.get(symbol, mt5.ORDER_FILLING_IOC)
-
+    fill = VALID_FILLING_MODES.get(SYMBOL, mt5.ORDER_FILLING_IOC)
     request = {
         "action": mt5.TRADE_ACTION_DEAL,
-        "symbol": symbol,
-        "volume": final_lot,
-        "type": type_op,
-        "price": price,
-        "sl": sl,
-        "tp": tp,
+        "symbol": SYMBOL, "volume": lots, "type": type_op,
+        "price": price, "sl": sl, "tp": tp,
         "magic": MAGIC_NUMBER,
-        "comment": f"Perry ({symbol} Conf: {int(confidence)}%)",
+        "comment": f"Perry v3 {order_type}",
         "type_time": mt5.ORDER_TIME_GTC,
-        "type_filling": fill_mode,
+        "type_filling": fill,
     }
-
-    result = mt5.order_send(request)
+    result = safe_order_send(request)
 
     if result and result.retcode == mt5.TRADE_RETCODE_DONE:
         session_stats["trades_executed"] += 1
-        time.sleep(0.2)
-        positions = mt5.positions_get(symbol=symbol)
-        if positions:
-            for p in positions:
-                if p.magic == MAGIC_NUMBER:
-                    ACTIVE_TRACKED_POSITIONS[p.ticket] = {
-                        "symbol": symbol,
-                        "type": order_type,
-                        "rsi": rsi_val,
-                        "macd": macd_val,
-                        "spread": current_spread_pips,
-                        "entry_price": price,
-                        "sl_distance": sl_distance,
-                        "be_applied": False
-                    }
-
-        msg = (
-            f"🚀 **ORDRE EXÉCUTÉ [{symbol}]**\n"
+        budget_mgr.register_trade_open(SYMBOL)
+        time.sleep(0.3)
+        for p in mt5.positions_get(symbol=SYMBOL) or []:
+            if p.magic == MAGIC_NUMBER:
+                ACTIVE_TRACKED_POSITIONS[p.ticket] = {
+                    "symbol": SYMBOL, "type": order_type,
+                    "rsi": rsi_val, "macd": atr_val,
+                    "spread": spread * 100,
+                    "entry_price": price,
+                    "sl_distance": sl_distance,
+                    "be_applied": False,
+                    "partial_done": False,
+                    "open_time": datetime.datetime.now(),
+                }
+        send_telegram_message(
+            f"🚀 **ORDRE {SYMBOL}** {order_type}\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"• **Type** : {order_type} | **Volume** : {final_lot} lot(s)\n"
-            f"• **Confiance Mémoire** : {confidence:.1f}%\n"
-            f"• **Spread d'entrée** : {current_spread_pips:.1f} pips | **R:R** : 1:{rr_ratio}\n"
-            f"• **Prix** : {price:.5f} | **SL** : {sl:.5f} | **TP** : {tp:.5f}"
+            f"• {lots} lot(s) | Risque {risky_dollars:.2f}$ ({risky_pct:.2f}%)\n"
+            f"• Confidence {confidence:.0f}%\n"
+            f"• Spread {spread:.2f}$\n"
+            f"• Prix {price:.2f} | SL {sl:.2f} | TP {tp:.2f}"
         )
-        send_telegram_message(msg)
+        save_state()
 
 
-def close_position(position):
+# Fermeture / Suivi
+
+def close_position(position, reason="Close"):
     tick = mt5.symbol_info_tick(position.symbol)
     if tick is None:
         return False
-
     type_op = mt5.ORDER_TYPE_SELL if position.type == mt5.ORDER_TYPE_BUY else mt5.ORDER_TYPE_BUY
     price = tick.bid if position.type == mt5.ORDER_TYPE_BUY else tick.ask
-    fill_mode = VALID_FILLING_MODES.get(position.symbol, mt5.ORDER_FILLING_IOC)
-
-    request = {
+    fill = VALID_FILLING_MODES.get(position.symbol, mt5.ORDER_FILLING_IOC)
+    result = safe_order_send({
         "action": mt5.TRADE_ACTION_DEAL,
-        "position": position.ticket,
-        "symbol": position.symbol,
-        "volume": position.volume,
-        "type": type_op,
-        "price": price,
-        "magic": MAGIC_NUMBER,
-        "comment": "Perry Close Signal Oppose",
-        "type_time": mt5.ORDER_TIME_GTC,
-        "type_filling": fill_mode,
-    }
-
-    result = mt5.order_send(request)
+        "position": position.ticket, "symbol": position.symbol,
+        "volume": position.volume, "type": type_op, "price": price,
+        "magic": MAGIC_NUMBER, "comment": f"Perry {reason}",
+        "type_time": mt5.ORDER_TIME_GTC, "type_filling": fill,
+    })
     if result and result.retcode == mt5.TRADE_RETCODE_DONE:
-        SYMBOL_COOLDOWNS[position.symbol] = datetime.datetime.now()
-        send_telegram_message(
-            f"🔄 **CLÔTURE ANTICIPÉE**\n━━━━━━━━━━━━━━━━━━━━\n• **Symbole** : {position.symbol}\n• **Raison** : Signal opposé ou clôture de sécurité")
+        with cooldown_lock:
+            SYMBOL_COOLDOWNS[position.symbol] = datetime.datetime.now()
+        send_telegram_message(f"🔄 **CLÔTURE {position.symbol}** ({reason})")
         return True
     return False
 
 
-def check_closed_positions():
-    global consecutive_losses, bot_pause_until
+def close_partial(position, fraction=PARTIAL_TP_PCT):
+    si = mt5.symbol_info(position.symbol)
+    if si is None:
+        return False
+    vol = round((position.volume * fraction) / si.volume_step) * si.volume_step
+    vol = round(vol, 2)
+    if vol < si.volume_min or vol >= position.volume:
+        return False
+    tick = mt5.symbol_info_tick(position.symbol)
+    if tick is None:
+        return False
+    type_op = mt5.ORDER_TYPE_SELL if position.type == mt5.ORDER_TYPE_BUY else mt5.ORDER_TYPE_BUY
+    price = tick.bid if position.type == mt5.ORDER_TYPE_BUY else tick.ask
+    fill = VALID_FILLING_MODES.get(position.symbol, mt5.ORDER_FILLING_IOC)
+    result = safe_order_send({
+        "action": mt5.TRADE_ACTION_DEAL,
+        "position": position.ticket, "symbol": position.symbol,
+        "volume": vol, "type": type_op, "price": price,
+        "magic": MAGIC_NUMBER, "comment": "Perry PartialTP",
+        "type_time": mt5.ORDER_TIME_GTC, "type_filling": fill,
+    })
+    return bool(result and result.retcode == mt5.TRADE_RETCODE_DONE)
 
+
+def close_all_open_positions():
+    for p in mt5.positions_get(group=f"*{MAGIC_NUMBER}*") or []:
+        close_position(p, "Shutdown")
+
+
+def check_closed_positions():
     if not ACTIVE_TRACKED_POSITIONS:
         return
+    current = mt5.positions_get(group=f"*{MAGIC_NUMBER}*")
+    curr_t = [p.ticket for p in current] if current else []
+    closed = [t for t in list(ACTIVE_TRACKED_POSITIONS.keys()) if t not in curr_t]
+    if not closed:
+        return
 
-    current_positions = mt5.positions_get(group=f"*{MAGIC_NUMBER}*")
-    current_tickets = [p.ticket for p in current_positions] if current_positions else []
-    closed_tickets = [ticket for ticket in list(ACTIVE_TRACKED_POSITIONS.keys()) if ticket not in current_tickets]
+    bal_now = get_account_balance()
 
-    for ticket in closed_tickets:
+    for ticket in closed:
         info = ACTIVE_TRACKED_POSITIONS.pop(ticket)
-        SYMBOL_COOLDOWNS[info["symbol"]] = datetime.datetime.now()
+        with cooldown_lock:
+            SYMBOL_COOLDOWNS[info["symbol"]] = datetime.datetime.now()
 
-        from_time = datetime.datetime.now() - datetime.timedelta(days=1)
-        history = mt5.history_deals_get(from_time, datetime.datetime.now() + datetime.timedelta(hours=1))
-
-        profit = 0.0
-        comment = ""
-        if history:
-            for deal in history:
-                if deal.position_id == ticket and deal.entry == mt5.DEAL_ENTRY_OUT:
-                    profit = deal.profit
-                    comment = deal.comment
+        hist = mt5.history_deals_get(
+            datetime.datetime.now() - datetime.timedelta(days=1),
+            datetime.datetime.now() + datetime.timedelta(hours=1))
+        profit, comment = 0.0, ""
+        if hist:
+            for d in hist:
+                if d.position_id == ticket and d.entry == mt5.DEAL_ENTRY_OUT:
+                    profit = d.profit
+                    comment = d.comment
                     break
 
-        if "sl" in comment.lower():
-            exit_type = "STOP_LOSS"
-        elif "tp" in comment.lower():
-            exit_type = "TAKE_PROFIT"
-        else:
-            exit_type = "TRAILING_OR_MANUAL"
-
-        result_status = "WIN" if profit > 0 else "LOSS"
+        exit_type = "STOP_LOSS" if "sl" in comment.lower() else \
+                    "TAKE_PROFIT" if "tp" in comment.lower() else "OTHER"
+        status = "WIN" if profit > 0 else "LOSS"
 
         pm.record_experience(
-            symbol=info['symbol'],
-            order_type=info['type'],
-            rsi_val=info['rsi'],
-            macd_val=info['macd'],
+            symbol=info['symbol'], order_type=info['type'],
+            rsi_val=info['rsi'], macd_val=info['macd'],
             spread_pips=info['spread'],
-            exit_type=exit_type,
-            result_status=result_status,
-            profit=profit
+            exit_type=exit_type, result_status=status, profit=profit,
+            balance_at_trade=bal_now, signal_quality=0)
+
+        budget_mgr.register_trade_close(info["symbol"], profit, bal_now)
+        budget_mgr.sync(bal_now)
+
+        emoji = "🎯" if profit > 0 else "💥" if profit < 0 else "⚖️"
+        send_telegram_message(
+            f"{emoji} **{info['symbol']}** {profit:+.2f} $ ({exit_type})"
         )
-
-        if profit > 0:
-            emoji = "🎯"
-            status_text = f"**GAIN VALIDÉ ({exit_type})**"
-            consecutive_losses = 0
-        elif profit < 0:
-            emoji = "💥"
-            status_text = f"**PERTE SUBIE ({exit_type})**"
-            consecutive_losses += 1
-        else:
-            emoji = "⚖️"
-            status_text = "**ÉQUILIBRE**"
-
-        msg = f"{emoji} {status_text}\n━━━━━━━━━━━━━━━━━━━━\n• **Symbole** : {info['symbol']}\n• **Profit/Perte** : {profit:+.2f} $"
-        send_telegram_message(msg)
-
-        if consecutive_losses >= MAX_CONSECUTIVE_LOSSES:
-            bot_pause_until = datetime.datetime.now() + datetime.timedelta(hours=PAUSE_HOURS_AFTER_LOSSES)
-            pause_msg = (
-                f"⏸ **PAUSE STRATÉGIQUE DÉCLENCHÉE** ⏸\n"
-                f"━━━━━━━━━━━━━━━━━━━━\n"
-                f"• **Raison** : {consecutive_losses} pertes consécutives\n"
-                f"• **Reprise prévue à** : {bot_pause_until.strftime('%H:%M:%S')}\n\n"
-                f"🔍 *Perry se met en pause pendant {PAUSE_HOURS_AFTER_LOSSES}h.*"
-            )
-            send_telegram_message(pause_msg)
-            consecutive_losses = 0
+        save_state()
 
 
 def manage_open_positions():
     now = datetime.datetime.now()
-    is_friday_evening = (now.weekday() == 4 and (now.hour > 21 or (now.hour == 21 and now.minute >= 30)))
+    is_fri_eve = now.weekday() == 4 and now.hour >= 20
 
     positions = mt5.positions_get(group=f"*{MAGIC_NUMBER}*")
     if not positions:
         return
 
     for pos in positions:
-        if is_friday_evening:
-            send_telegram_message(
-                f"⚠️ **SÉCURITÉ WEEK-END**\n\nClôture automatique de **{pos.symbol}** avant fermeture du marché.")
-            close_position(pos)
+        if is_fri_eve:
+            send_telegram_message(f"⚠️ Week-end : clôture {pos.symbol}")
+            close_position(pos, "Weekend")
             continue
 
-        ticket = pos.ticket
-        if ticket not in ACTIVE_TRACKED_POSITIONS:
+        t = pos.ticket
+        if t not in ACTIVE_TRACKED_POSITIONS:
             continue
-
-        pos_info = ACTIVE_TRACKED_POSITIONS[ticket]
-        symbol_info = mt5.symbol_info(pos.symbol)
+        info = ACTIVE_TRACKED_POSITIONS[t]
+        si = mt5.symbol_info(pos.symbol)
         tick = mt5.symbol_info_tick(pos.symbol)
-        atr_val = pm.get_atr_value(pos.symbol)
-
-        if symbol_info is None or tick is None or atr_val is None:
+        atr = pm.get_atr_value(pos.symbol)
+        if not (si and tick and atr):
             continue
 
-        entry_price = pos_info["entry_price"]
-        sl_distance = pos_info["sl_distance"]
+        entry = info["entry_price"]
+        sl_dist = info["sl_distance"]
+
+        # Time-stop
+        op_time = info.get("open_time")
+        if op_time and (now - op_time).total_seconds() > TIME_STOP_HOURS * 3600:
+            profit_dist = (tick.bid - entry) if pos.type == mt5.ORDER_TYPE_BUY else (entry - tick.ask)
+            if profit_dist < sl_dist * 0.3:
+                close_position(pos, "TimeStop")
+                continue
 
         if pos.type == mt5.ORDER_TYPE_BUY:
-            current_profit_dist = tick.bid - entry_price
-            if current_profit_dist >= sl_distance and not pos_info["be_applied"]:
-                new_sl = entry_price + (symbol_info.point * 10)
-                res = mt5.order_send({
-                    "action": mt5.TRADE_ACTION_SLTP,
-                    "position": ticket,
-                    "sl": new_sl,
-                    "tp": pos.tp,
-                })
-                if res and res.retcode == mt5.TRADE_RETCODE_DONE:
-                    pos_info["be_applied"] = True
-                    send_telegram_message(
-                        f"🛡️ **BREAKEVEN APPLIQUÉ** [{pos.symbol}]\n━━━━━━━━━━━━━━━━━━━━\n• **Ticket** : #{ticket}\n• **Nouveau SL** : {new_sl:.5f} (Risque zéro)")
-
-            if pos_info["be_applied"]:
-                trailing_sl = tick.bid - (atr_val * ATR_TRAILING_MULTIPLIER)
-                if trailing_sl > pos.sl:
-                    res_trail = mt5.order_send({
-                        "action": mt5.TRADE_ACTION_SLTP,
-                        "position": ticket,
-                        "sl": trailing_sl,
-                        "tp": pos.tp,
-                    })
-                    if res_trail and res_trail.retcode == mt5.TRADE_RETCODE_DONE:
-                        send_telegram_message(
-                            f"📈 **TRAILING STOP AJUSTÉ** [{pos.symbol}]\n• Nouveau SL : {trailing_sl:.5f}")
+            prof = tick.bid - entry
+            if not info.get("partial_done") and prof >= sl_dist * PARTIAL_TP_R:
+                if close_partial(pos):
+                    info["partial_done"] = True
+                    send_telegram_message(f"💰 TP partiel 50% sur {pos.symbol}")
+            if not info["be_applied"] and prof >= sl_dist * ATR_BE_TRIGGER:
+                new_sl = entry + (si.point * 10)
+                min_dist = si.trade_stops_level * si.point
+                if tick.bid - new_sl < min_dist:
+                    new_sl = tick.bid - min_dist
+                r = safe_order_send({"action": mt5.TRADE_ACTION_SLTP,
+                                     "position": t, "sl": new_sl, "tp": pos.tp})
+                if r and r.retcode == mt5.TRADE_RETCODE_DONE:
+                    info["be_applied"] = True
+                    send_telegram_message(f"🛡️ BE {pos.symbol} → {new_sl:.2f}")
+            if info["be_applied"]:
+                trail = tick.bid - atr * ATR_TRAILING_MULTIPLIER
+                if trail > pos.sl:
+                    safe_order_send({"action": mt5.TRADE_ACTION_SLTP,
+                                     "position": t, "sl": trail, "tp": pos.tp})
 
         elif pos.type == mt5.ORDER_TYPE_SELL:
-            current_profit_dist = entry_price - tick.ask
-            if current_profit_dist >= sl_distance and not pos_info["be_applied"]:
-                new_sl = entry_price - (symbol_info.point * 10)
-                res = mt5.order_send({
-                    "action": mt5.TRADE_ACTION_SLTP,
-                    "position": ticket,
-                    "sl": new_sl,
-                    "tp": pos.tp,
-                })
-                if res and res.retcode == mt5.TRADE_RETCODE_DONE:
-                    pos_info["be_applied"] = True
-                    send_telegram_message(
-                        f"🛡️ **BREAKEVEN APPLIQUÉ** [{pos.symbol}]\n━━━━━━━━━━━━━━━━━━━━\n• **Ticket** : #{ticket}\n• **Nouveau SL** : {new_sl:.5f} (Risque zéro)")
+            prof = entry - tick.ask
+            if not info.get("partial_done") and prof >= sl_dist * PARTIAL_TP_R:
+                if close_partial(pos):
+                    info["partial_done"] = True
+                    send_telegram_message(f"💰 TP partiel 50% sur {pos.symbol}")
+            if not info["be_applied"] and prof >= sl_dist * ATR_BE_TRIGGER:
+                new_sl = entry - (si.point * 10)
+                min_dist = si.trade_stops_level * si.point
+                if new_sl - tick.ask < min_dist:
+                    new_sl = tick.ask + min_dist
+                r = safe_order_send({"action": mt5.TRADE_ACTION_SLTP,
+                                     "position": t, "sl": new_sl, "tp": pos.tp})
+                if r and r.retcode == mt5.TRADE_RETCODE_DONE:
+                    info["be_applied"] = True
+                    send_telegram_message(f"🛡️ BE {pos.symbol} → {new_sl:.2f}")
+            if info["be_applied"]:
+                trail = tick.ask + atr * ATR_TRAILING_MULTIPLIER
+                if pos.sl == 0 or trail < pos.sl:
+                    safe_order_send({"action": mt5.TRADE_ACTION_SLTP,
+                                     "position": t, "sl": trail, "tp": pos.tp})
 
-            if pos_info["be_applied"]:
-                trailing_sl = tick.ask + (atr_val * ATR_TRAILING_MULTIPLIER)
-                if pos.sl == 0 or trailing_sl < pos.sl:
-                    res_trail = mt5.order_send({
-                        "action": mt5.TRADE_ACTION_SLTP,
-                        "position": ticket,
-                        "sl": trailing_sl,
-                        "tp": pos.tp,
-                    })
-                    if res_trail and res_trail.retcode == mt5.TRADE_RETCODE_DONE:
-                        send_telegram_message(
-                            f"📈 **TRAILING STOP AJUSTÉ** [{pos.symbol}]\n• Nouveau SL : {trailing_sl:.5f}")
+
+# Rapport
+def update_closed_trades_stats():
+    from_date = session_stats.get("start_time", datetime.datetime.now())
+    to_date = datetime.datetime.now() + datetime.timedelta(hours=1)
+    hist = mt5.history_deals_get(from_date, to_date)
+    if hist is None:
+        return
+    w = l = 0
+    for d in hist:
+        if d.entry == mt5.DEAL_ENTRY_OUT and d.magic == MAGIC_NUMBER:
+            if d.profit > 0: w += 1
+            elif d.profit < 0: l += 1
+    session_stats["closed_wins"] = w
+    session_stats["closed_losses"] = l
+
+
+def send_session_summary(header="📊 **BILAN**"):
+    update_closed_trades_stats()
+    cur = get_account_balance()
+    init = session_stats["initial_balance"]
+    pnl = cur - init
+    pct = (pnl / init * 100) if init > 0 else 0
+    w = session_stats.get("closed_wins", 0)
+    l = session_stats.get("closed_losses", 0)
+    t = w + l
+    wr = (w / t * 100) if t > 0 else 0
+
+    send_telegram_message(
+        f"{header}\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"💰 Initial : {init:.2f} $\n"
+        f"💵 Actuel  : {cur:.2f} $\n"
+        f"📈 PnL    : {pnl:+.2f} $ ({pct:+.2f}%)\n"
+        f"✅ Trades : {t} (W:{w} | L:{l})\n"
+        f"🎯 Win Rate : {wr:.1f} %"
+    )
+
+
+def send_budget_status():
+    cur = get_account_balance()
+    s = budget_mgr.get_status(cur)
+    pause = "⏸️ PAUSE" if s["paused"] else "🟢 Actif"
+    if s["paused"]:
+        pause += f" jusqu'à {s['pause_until']}"
+    msg = (
+        f"💼 **BUDGET**\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"💰 Solde : {s['balance']:.2f} $\n"
+        f"📈 Pic   : {s['peak']:.2f} $\n"
+        f"📉 DD    : {s['drawdown_pct']:.2f} %\n"
+        f"🎯 Risque base : {s['base_risk_pct']:.2f} %\n"
+        f"⚙️ Risque eff. : {s['effective_risk_pct']:.2f} %\n"
+        f"📊 Trades jour : {s['day_trades']} / {s['day_max']}\n"
+        f"🔥 W:{s['consec_wins']} | L:{s['consec_losses']}\n"
+    )
+    if s["recovery_mode"]:
+        msg += f"♻️ Récupération : {s['recovery_left']} trades\n"
+    msg += f"🚦 {pause}"
+    send_telegram_message(msg)
+
+
+def send_telegram_state_status():
+    conn = "✅ Connecté" if mt5.terminal_info() else "🚨 Déconnecté"
+    positions = mt5.positions_get(group=f"*{MAGIC_NUMBER}*")
+    nb = len(positions) if positions else 0
+    spread = get_current_spread_dollars()
+    spread_str = f"{spread:.2f} $" if spread else "?"
+    up = session_stats['start_time'].strftime('%d/%m %H:%M') if session_stats.get('start_time') else "?"
+    send_telegram_message(
+        f"🖥🐻 **ÉTAT PERRY v3**\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"🔌 MT5 : {conn}\n"
+        f"💱 Symbole : {SYMBOL} M30\n"
+        f"📊 Position : {nb} / {MAX_CONCURRENT_TRADES}\n"
+        f"📏 Spread : {spread_str}\n"
+        f"⏱️ Session : {up}\n"
+        f"💰 Solde : {get_account_balance():.2f} $"
+    )
+
+
+def send_technical_status():
+    _, rsi, atr, df = check_signal()
+    if df is None:
+        send_telegram_message("⚠️ Pas de données")
+        return
+    c = df.iloc[-2]
+    t = df['time'].iloc[-2]
+    msg = (
+        f"🔬🐻 **ANALYSE TECHNIQUE {SYMBOL}**\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"⏰ Barre : {t.strftime('%d/%m %H:%M')} UTC\n"
+        f"💵 Prix : {c['close']:.2f}\n"
+        f"📈 EMA20 : {c['EMA20']:.2f}\n"
+        f"📈 EMA50 : {c['EMA50']:.2f}\n"
+        f"📊 RSI : {c['RSI']:.1f}\n"
+        f"📊 ADX : {c['ADX']:.1f}\n"
+        f"📊 ATR : {c['ATR']:.2f}$\n"
+        f"📊 ATR ratio : {c['ATR_RATIO']:.2f}\n"
+        f"Tendance : {'UP' if c['EMA20'] > c['EMA50'] else 'DOWN'}"
+    )
+    send_telegram_message(msg)
+
+
+# Suiveur de Telegram
+
+def listen_telegram_commands():
+    global is_running, pull_requested
+    last_id = 0
+    try:
+        r = requests.get(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates", timeout=5).json()
+        if "result" in r and r["result"]:
+            last_id = r["result"][-1]["update_id"]
+    except Exception:
+        pass
+
+    while is_running:
+        try:
+            url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates?offset={last_id+1}&timeout=10"
+            r = requests.get(url, timeout=12).json()
+            if "result" not in r:
+                continue
+
+            for upd in r["result"]:
+                last_id = upd["update_id"]
+                if "message" not in upd or "text" not in upd["message"]:
+                    continue
+                text = upd["message"]["text"].strip().lower()
+                chat = str(upd["message"]["chat"]["id"])
+                if chat != str(TELEGRAM_CHAT_ID):
+                    continue
+
+                if text == "/start":
+                    bal = get_account_balance()
+                    session_stats["start_time"] = datetime.datetime.now()
+                    session_stats["initial_balance"] = bal
+                    session_stats["trades_executed"] = 0
+                    session_stats["closed_wins"] = 0
+                    session_stats["closed_losses"] = 0
+                    budget_mgr.reset_day(bal)
+                    budget_mgr.sync(bal)
+                    save_state()
+                    send_telegram_message(
+                        f"🚀 **SESSION PERRY v3**\n"
+                        f"• {SYMBOL} M30 Pullback\n"
+                        f"• Capital : {bal:.2f} $\n\n"
+                        f"/budget /state /status /tech /stop /pull"
+                    )
+                elif text == "/budget": send_budget_status()
+                elif text == "/state":  send_telegram_state_status()
+                elif text == "/status": send_session_summary()
+                elif text == "/tech":   send_technical_status()
+                elif text == "/pull":
+                    send_telegram_message("🔄 git pull. Arrêt sécurisé...")
+                    pull_requested = True
+                    is_running = False
+                elif text == "/stop":
+                    send_telegram_message("🛑 Arrêt demandé.")
+                    is_running = False
+        except Exception:
+            time.sleep(2)
 
 
 # Lancement des OPs Agent P
-
 if __name__ == "__main__":
     initialize_mt5()
     pm.init_db()
-    restore_tracked_positions()
+    load_state()
+    restore_tracked_positions = None  # désactivé en v3 (mono-actif)
 
-    session_stats["start_time"] = datetime.datetime.now()
-    session_stats["initial_balance"] = get_account_balance()
+    # Reprendre positions existantes
+    existing = mt5.positions_get(group=f"*{MAGIC_NUMBER}*")
+    if existing:
+        for p in existing:
+            si = mt5.symbol_info(p.symbol)
+            point = si.point if si else 0.01
+            sl_dist = abs(p.price_open - p.sl) if p.sl > 0 else (300 * point)
+            be_done = (p.type == mt5.ORDER_TYPE_BUY and p.sl >= p.price_open) or \
+                      (p.type == mt5.ORDER_TYPE_SELL and p.sl <= p.price_open)
+            ACTIVE_TRACKED_POSITIONS[p.ticket] = {
+                "symbol": p.symbol,
+                "type": "BUY" if p.type == mt5.ORDER_TYPE_BUY else "SELL",
+                "rsi": 50.0, "macd": 0.0, "spread": 30,
+                "entry_price": p.price_open, "sl_distance": sl_dist,
+                "be_applied": be_done, "partial_done": False,
+                "open_time": datetime.datetime.now(),
+            }
+        print(f"🔄 {len(existing)} position(s) reprise(s).")
 
-    # Thread d'écoute des commandes Telegram
-    telegram_thread = threading.Thread(target=listen_telegram_commands, daemon=True)
-    telegram_thread.start()
+    bal = get_account_balance()
+    budget_mgr.sync(bal)
 
-    pairs_str = ", ".join(SYMBOLS)
-    start_msg = (
-        f"🐻 **PERRY LE TRADER H1+ADX ACTIVÉ**\n"
+    if not session_stats.get("initial_balance"):
+        session_stats["start_time"] = datetime.datetime.now()
+        session_stats["initial_balance"] = bal
+    save_state()
+
+    threading.Thread(target=_telegram_worker, daemon=True).start()
+    threading.Thread(target=news_refresher_thread, daemon=True).start()
+    threading.Thread(target=listen_telegram_commands, daemon=True).start()
+
+    spread = get_current_spread_dollars()
+    send_telegram_message(
+        f"🐻 **PERRY v3 DÉMARRÉ**\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"• **Paires surveillées** : {pairs_str}\n"
-        f"• **Timeframe** : M5 (Filtre Tendance H1 + ADX > 22)\n"
-        f"• **Solde Initial** : {session_stats['initial_balance']:.2f} $\n\n"
-        f"📱 **Commandes Telegram actives :**\n"
-        f"• `/kpi` : Métriques de la semaine\n"
-        f"• `/state` : État technique\n"
-        f"• `/status` : Bilan en direct\n"
-        f"• `/stop` : Arrêt d'urgence"
+        f"• Actif : **{SYMBOL}** M30\n"
+        f"• Stratégie : Pullback EMA20 + RSI + ADX + ATR\n"
+        f"• RR : 1:{RR_RATIO}\n"
+        f"• Solde : {bal:.2f} $\n"
+        f"• Spread : {spread:.2f} $\n\n"
+        f"/budget /state /status /tech /stop /pull"
     )
-    print(start_msg)
-    send_telegram_message(start_msg)
 
     try:
         while is_running:
+            t0 = time.time()
 
             if not ensure_mt5_connection():
                 time.sleep(10)
                 continue
 
-            if not check_funds_and_loss_safety():
+            bal = get_account_balance()
+            budget_mgr.sync(bal)
+
+            if bal < MIN_BALANCE_STOP:
+                send_telegram_message(f"⚠️ Solde {bal:.2f}$ < {MIN_BALANCE_STOP}$ → arrêt.")
+                is_running = False
                 break
 
             check_closed_positions()
             manage_open_positions()
+            budget_mgr.flush_pending()
 
-            if bot_pause_until is None or datetime.datetime.now() >= bot_pause_until:
-                for symbol in SYMBOLS:
-                    signal, rsi_val, macd_val = check_signal(symbol)
-                    positions = mt5.positions_get(symbol=symbol)
+            can_trade, reason = budget_mgr.can_open_trade(SYMBOL, bal)
+            if can_trade:
+                signal, rsi_v, atr_v, df = check_signal()
+                positions = mt5.positions_get(symbol=SYMBOL)
 
-                    if positions and len(positions) > 0:
-                        for pos in positions:
-                            if pos.magic == MAGIC_NUMBER:
-                                if pos.type == mt5.ORDER_TYPE_BUY and signal == "SELL":
-                                    if close_position(pos):
-                                        send_order(symbol, "SELL", rsi_val, macd_val)
-                                elif pos.type == mt5.ORDER_TYPE_SELL and signal == "BUY":
-                                    if close_position(pos):
-                                        send_order(symbol, "BUY", rsi_val, macd_val)
-                    else:
-                        if signal in ["BUY", "SELL"]:
-                            send_order(symbol, signal, rsi_val, macd_val)
+                if positions and len(positions) > 0:
+                    for pos in positions:
+                        if pos.magic != MAGIC_NUMBER:
+                            continue
+                        # Signal opposé → on clôture
+                        pos_type = "BUY" if pos.type == mt5.ORDER_TYPE_BUY else "SELL"
+                        if signal and signal != pos_type:
+                            if close_position(pos, "Reversal"):
+                                time.sleep(1)
+                                send_order(signal, rsi_v, atr_v, df)
+                else:
+                    if signal in ["BUY", "SELL"]:
+                        send_order(signal, rsi_v, atr_v, df)
 
-            time.sleep(1)
+            elapsed = time.time() - t0
+            if elapsed > 5.0:
+                print(f"⚠️ Cycle lent : {elapsed:.2f}s")
+
+            time.sleep(CYCLE_SLEEP_SEC)
 
     except KeyboardInterrupt:
-        print("Arrêt manuel effectué :/")
-        send_session_summary("📊 **BILAN MANUEL DE SESSION**")
+        print("Arrêt manuel.")
+
+    # Cleanup
+    print("🧹 Cleanup...")
+    if pull_requested:
+        save_state()
+        budget_mgr.flush_pending()
+        flush_telegram(3.0)
         mt5.shutdown()
+        sys.exit(99)
+    else:
+        try:
+            close_all_open_positions()
+        except Exception as e:
+            print(f"Cleanup : {e}")
+        send_session_summary("📊 **BILAN FINAL**")
+        save_state()
+        budget_mgr.flush_pending()
+        flush_telegram(3.0)
+        mt5.shutdown()
+        sys.exit(0)

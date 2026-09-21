@@ -2,45 +2,38 @@
 title Perry Le Trader - Superviseur VPS
 cd /d "C:\Projet forex bot"
 
-echo ================================================
-echo   Lancement de l'ecosysteme Perry Le Trader
-echo ================================================
+if not exist "logs" mkdir logs
 
-:: Lancement initial de MetaTrader 5
-start "" "C:\Program Files\MetaTrader 5\terminal64.exe"
-echo Attente du chargement de MetaTrader 5 (20 secondes)...
-timeout /t 20 /nobreak > nul
+tasklist /FI "IMAGENAME eq terminal64.exe" 2>NUL | find /I "terminal64.exe" >NUL
+if errorlevel 1 (
+    echo Lancement de MetaTrader 5...
+    start "" "C:\Program Files\MetaTrader 5\terminal64.exe"
+    timeout /t 20 /nobreak > nul
+) else (
+    echo MT5 deja en cours.
+)
 
 :loop
-echo [%date% %time%] Demarrage du script Python de Perry...
-python "bot.py"
+set LOGFILE=logs\perry_%date:~-4,4%%date:~-7,2%%date:~-10,2%.log
+echo [%date% %time%] Demarrage bot.py >> "%LOGFILE%"
+python "bot.py" >> "%LOGFILE%" 2>&1
 
 set exit_code=%errorlevel%
-echo [%date% %time%] Perry s'est arrete avec le code : %exit_code%
+echo [%date% %time%] Arret code : %exit_code% >> "%LOGFILE%"
 
-:: Code 99 (Commande /pull via Telegram) -> Git Pull + Relance automatique
 if %exit_code% EQU 99 (
-    echo.
-    echo [%date% %time%] --- MISE A JOUR GIT EN COURS ---
-    git pull
-    echo [%date% %time%] --- MISE A JOUR TERMINEE ---
-    echo Redemarrage de Perry dans 3 secondes...
+    git pull >> "%LOGFILE%" 2>&1
     timeout /t 3 /nobreak > nul
     goto loop
 )
-
-:: Code 0 (Commande /stop via Telegram) -> On coupe la boucle définitivement
 if %exit_code% EQU 0 (
-    echo [%date% %time%] Arret volontaire de Perry detecte (/stop). Fermeture du superviseur.
+    echo Arret volontaire. >> "%LOGFILE%"
     goto end
 )
 
-:: En cas de crash ou d'erreur, on fige l'écran pour lire l'erreur exacte au lieu de boucler en silence
-echo [%date% %time%] Une erreur est survenue (Code %exit_code%).
-echo Regardez le message ci-dessus, puis appuyez sur une touche pour relancer...
-pause
+echo CRASH code %exit_code%. Restart 30s... >> "%LOGFILE%"
+timeout /t 30 /nobreak > nul
 goto loop
 
 :end
-echo Superviseur arrete avec succes.
-pause
+echo Superviseur arrete.
