@@ -8,11 +8,12 @@ echo ================================================
 
 :: Lancement initial de MetaTrader 5
 start "" "C:\Program Files\MetaTrader 5\terminal64.exe"
+echo Attente du chargement de MetaTrader 5 (20 secondes)...
 timeout /t 20 /nobreak > nul
 
 :loop
 echo [%date% %time%] Demarrage du script Python de Perry...
-python "bot_2.py"
+python "bot.py"
 
 set exit_code=%errorlevel%
 echo [%date% %time%] Perry s'est arrete avec le code : %exit_code%
@@ -23,7 +24,7 @@ if %exit_code% EQU 99 (
     echo [%date% %time%] --- MISE A JOUR GIT EN COURS ---
     git pull
     echo [%date% %time%] --- MISE A JOUR TERMINEE ---
-    echo Redemarrage de Perry avec la nouvelle version dans 3 secondes...
+    echo Redemarrage de Perry dans 3 secondes...
     timeout /t 3 /nobreak > nul
     goto loop
 )
@@ -34,9 +35,10 @@ if %exit_code% EQU 0 (
     goto end
 )
 
-:: Crash ou coupure réseau inattendue -> Relance automatique de sécurité après 10 sec
-echo [%date% %time%] Crash ou erreur detectee (Code %exit_code%). Relance automatique dans 10 secondes...
-timeout /t 15 /nobreak > nul
+:: En cas de crash ou d'erreur, on fige l'écran pour lire l'erreur exacte au lieu de boucler en silence
+echo [%date% %time%] Une erreur est survenue (Code %exit_code%).
+echo Regardez le message ci-dessus, puis appuyez sur une touche pour relancer...
+pause
 goto loop
 
 :end
