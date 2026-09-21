@@ -285,12 +285,17 @@ def init_filling_modes():
     if info is None:
         VALID_FILLING_MODES[SYMBOL] = mt5.ORDER_FILLING_IOC
         return
-    if info.filling_mode & mt5.SYMBOL_FILLING_IOC:
+
+    fill_flags = getattr(info, "filling_mode", 0)
+
+    if fill_flags & 2:      # IOC autorisé
         VALID_FILLING_MODES[SYMBOL] = mt5.ORDER_FILLING_IOC
-    elif info.filling_mode & mt5.SYMBOL_FILLING_FOK:
+    elif fill_flags & 1:    # FOK autorisé seulement
         VALID_FILLING_MODES[SYMBOL] = mt5.ORDER_FILLING_FOK
     else:
         VALID_FILLING_MODES[SYMBOL] = mt5.ORDER_FILLING_RETURN
+
+    print(f"✅ Mode de remplissage {SYMBOL} : {VALID_FILLING_MODES[SYMBOL]}")
 
 
 def ensure_mt5_connection():
